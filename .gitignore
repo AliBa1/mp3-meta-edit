@@ -1,0 +1,13 @@
+# Binary
+mp3metaedit
+
+# Data files
+/covers/
+mp3metaedit_lists.json
+
+# Go
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db
