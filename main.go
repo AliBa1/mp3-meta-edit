@@ -1,22 +1,37 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	_ "image/jpeg"
-	_ "image/png"
+	"image/png"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/bogem/id3v2"
+	"github.com/chzyer/readline"
 	"github.com/disintegration/imaging"
 )
 
-var stdin = bufio.NewReader(os.Stdin)
+var rl *readline.Instance
+
+// readLine reads a line of input, with no default text.
+func readLine() (string, error) {
+	return rl.Readline()
+}
+
+// readLineWithDefault reads a line of input, pre-filling the editable buffer
+// with def so the user can edit it (e.g. backspace out unwanted characters)
+// instead of retyping it from scratch.
+func readLineWithDefault(def string) (string, error) {
+	if def != "" {
+		rl.WriteStdin([]byte(def))
+	}
+	return rl.Readline()
+}
 
 // to run: go run . [drag file or folder into terminal]
 // to build: go build -o mp3metaedit .
@@ -86,7 +101,7 @@ func promptFromList(label string, items []string, validate func(string) bool) st
 	}
 	fmt.Print("Enter number to select, or type a new " + label + ": ")
 
-	input, err := stdin.ReadString('\n')
+	input, err := readLine()
 	input = strings.TrimSpace(input)
 	input = strings.Trim(input, "'")
 
@@ -116,10 +131,10 @@ func printHelp() {
 	fmt.Println("Usage: mp3metaedit <file|folder>")
 	fmt.Println()
 	fmt.Println("Single file mode:")
-	fmt.Println("  Edit title, artist, album, and cover art for one MP3 file.")
+	fmt.Println("  Edit title, artist, album, and cover art for one MP3 or M4A file.")
 	fmt.Println()
 	fmt.Println("Folder mode:")
-	fmt.Println("  Edit artist, album, and cover art for all MP3 files in a folder.")
+	fmt.Println("  Edit artist, album, and cover art for all MP3 and M4A files in a folder.")
 	fmt.Println()
 	fmt.Println("Cover art:")
 	fmt.Println("  Place images in a covers/ folder next to the executable for quick selection.")
@@ -146,6 +161,12 @@ func main() {
 		log.Fatalf("Failed to access path: %v", err)
 	}
 
+	rl, err = readline.New("")
+	if err != nil {
+		log.Fatal("Error initializing input: ", err)
+	}
+	defer rl.Close()
+
 	loadLists()
 
 	if info.IsDir() {
@@ -164,37 +185,54 @@ func sanitizeFilename(name string) string {
 	return strings.TrimSpace(replacer.Replace(name))
 }
 
-// renameToTitle renames the file to match the title tag if they differ.
-func renameToTitle(filePath, title string) {
-	if title == "" {
-		return
+// titleOrFilename returns the file's current title tag, falling back to its
+// filename (without extension) when there's no title set, so there's always
+// something sensible to pre-fill the title prompt with.
+func titleOrFilename(file AudioTag, path string) string {
+	if title := file.Title(); title != "" {
+		return title
 	}
-	dir := filepath.Dir(filePath)
-	newName := sanitizeFilename(title) + ".mp3"
-	newPath := filepath.Join(dir, newName)
-	if filepath.Base(filePath) == newName {
-		return
+	base := filepath.Base(path)
+	return strings.TrimSuffix(base, filepath.Ext(base))
+}
+
+// renameToMatchTitle renames filePath so its basename matches title
+// (preserving the extension). No-op if title is empty or already matches.
+// Returns the file's path after the (possible) rename.
+func renameToMatchTitle(filePath, title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return filePath
+	}
+
+	newName := sanitizeFilename(title)
+	if newName == "" {
+		return filePath
+	}
+	newName += filepath.Ext(filePath)
+
+	newPath := filepath.Join(filepath.Dir(filePath), newName)
+	if newPath == filePath {
+		return filePath
 	}
 	if err := os.Rename(filePath, newPath); err != nil {
 		fmt.Println("Warning: could not rename file:", err)
-		return
+		return filePath
 	}
-	fmt.Printf("Renamed file to: %s\n", newName)
+	fmt.Printf("Renamed to: %s\n", newName)
+	return newPath
 }
 
 // ---- Single file mode ----
 
 func fileMode(filePath string) {
-	mp3File, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
+	audioFile, err := openAudioTag(filePath)
 	if err != nil {
-		log.Fatal("Error opening mp3 file: ", err)
+		log.Fatal("Error opening audio file: ", err)
 	}
-	if mp3File == nil {
-		log.Fatal("File doesn't exist or is empty")
-	}
-	defer mp3File.Close()
+	defer audioFile.Close()
 
-	viewTags(mp3File)
+	viewTags(audioFile)
 
 	for {
 		fmt.Println("0: Save & Quit")
@@ -206,7 +244,7 @@ func fileMode(filePath string) {
 		fmt.Println("")
 		fmt.Print("Select an option: ")
 
-		line, _ := stdin.ReadString('\n')
+		line, _ := readLine()
 		option, err := strconv.Atoi(strings.TrimSpace(line))
 		if err != nil {
 			fmt.Println("Invalid option")
@@ -215,21 +253,21 @@ func fileMode(filePath string) {
 
 		switch option {
 		case 0:
-			if err = mp3File.Save(); err != nil {
-				log.Fatal("Error saving changes to mp3: ", err)
+			if err = audioFile.Save(); err != nil {
+				log.Fatal("Error saving changes: ", err)
 			}
-			renameToTitle(filePath, mp3File.Title())
+			renameToMatchTitle(filePath, audioFile.Title())
 			return
 		case 1:
-			mp3File.SetTitle(promptTitle())
+			audioFile.SetTitle(promptTitle(titleOrFilename(audioFile, filePath)))
 		case 2:
-			mp3File.SetArtist(promptArtist())
+			audioFile.SetArtist(promptArtist())
 		case 3:
-			mp3File.SetAlbum(promptAlbum())
+			audioFile.SetAlbum(promptAlbum())
 		case 4:
-			applyCoverArt(mp3File, promptCoverArt())
+			applyCoverArt(audioFile, promptCoverArt())
 		case 5:
-			viewTags(mp3File)
+			viewTags(audioFile)
 		default:
 			fmt.Println("That option is not listed. Try again.")
 		}
@@ -244,10 +282,11 @@ func folderMode(folder string) {
 		fmt.Println("1: Edit Artist  (all files)")
 		fmt.Println("2: Edit Album   (all files)")
 		fmt.Println("3: Edit Cover Art (all files)")
+		fmt.Println("4: Edit Title   (one by one)")
 		fmt.Println("")
 		fmt.Print("Select an option: ")
 
-		line, _ := stdin.ReadString('\n')
+		line, _ := readLine()
 		option, err := strconv.Atoi(strings.TrimSpace(line))
 		if err != nil {
 			fmt.Println("Invalid option")
@@ -259,36 +298,38 @@ func folderMode(folder string) {
 			return
 		case 1:
 			artist := promptArtist()
-			applyToFolder(folder, func(f *id3v2.Tag) { f.SetArtist(artist) })
+			applyToFolder(folder, func(f AudioTag) { f.SetArtist(artist) })
 		case 2:
 			album := promptAlbum()
-			applyToFolder(folder, func(f *id3v2.Tag) { f.SetAlbum(album) })
+			applyToFolder(folder, func(f AudioTag) { f.SetAlbum(album) })
 		case 3:
 			imgPath := promptCoverArt()
-			applyToFolder(folder, func(f *id3v2.Tag) { applyCoverArt(f, imgPath) })
+			applyToFolder(folder, func(f AudioTag) { applyCoverArt(f, imgPath) })
+		case 4:
+			editTitlesOneByOne(folder)
 		default:
 			fmt.Println("That option is not listed. Try again.")
 		}
 	}
 }
 
-func applyToFolder(folder string, action func(*id3v2.Tag)) {
+func applyToFolder(folder string, action func(AudioTag)) {
 	err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".mp3") {
+		if !info.IsDir() && isAudioFile(info.Name()) {
 			fmt.Printf("Processing: %s\n", path)
-			mp3File, err := id3v2.Open(path, id3v2.Options{Parse: true})
+			audioFile, err := openAudioTag(path)
 			if err != nil {
 				log.Printf("Error opening %s: %v", path, err)
 				return nil
 			}
-			action(mp3File)
-			if err = mp3File.Save(); err != nil {
+			action(audioFile)
+			if err = audioFile.Save(); err != nil {
 				log.Printf("Error saving %s: %v", path, err)
 			}
-			mp3File.Close()
+			audioFile.Close()
 		}
 		return nil
 	})
@@ -297,22 +338,59 @@ func applyToFolder(folder string, action func(*id3v2.Tag)) {
 	}
 }
 
+// editTitlesOneByOne walks the folder and, for each file, prompts for a
+// title (pre-filled with the current one), saves it, and renames the file
+// to match.
+func editTitlesOneByOne(folder string) {
+	var audioFiles []string
+	err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && isAudioFile(info.Name()) {
+			audioFiles = append(audioFiles, path)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Error reading folder: %v", err)
+	}
+
+	for i, path := range audioFiles {
+		fmt.Printf("\n[%d/%d] %s\n", i+1, len(audioFiles), filepath.Base(path))
+		audioFile, err := openAudioTag(path)
+		if err != nil {
+			log.Printf("Error opening %s: %v", path, err)
+			continue
+		}
+
+		title := promptTitle(titleOrFilename(audioFile, path))
+		audioFile.SetTitle(title)
+		if err := audioFile.Save(); err != nil {
+			log.Printf("Error saving %s: %v", path, err)
+		}
+		audioFile.Close()
+
+		renameToMatchTitle(path, title)
+	}
+}
+
 // ---- Prompts ----
 
-func viewTags(file *id3v2.Tag) {
+func viewTags(file AudioTag) {
 	fmt.Println("Title: ", file.Title())
 	fmt.Println("Artist: ", file.Artist())
 	fmt.Println("Album: ", file.Album())
 	fmt.Println("")
 }
 
-func promptTitle() string {
-	fmt.Print("Title: ")
-	val, err := stdin.ReadString('\n')
+func promptTitle(current string) string {
+	fmt.Printf("Title [%s]: ", current)
+	val, err := readLineWithDefault(current)
 	val = strings.TrimSpace(val)
 	if err != nil || val == "" {
 		fmt.Println("Title cannot be empty!")
-		return promptTitle()
+		return promptTitle(current)
 	}
 	return val
 }
@@ -344,7 +422,7 @@ func promptCoverArt() string {
 		}
 		fmt.Print("Enter number to select, or type a full path: ")
 
-		input, err := stdin.ReadString('\n')
+		input, err := readLine()
 		input = strings.TrimSpace(input)
 		input = strings.Trim(input, "'")
 
@@ -373,7 +451,7 @@ func promptCoverArt() string {
 
 // ---- Cover art ----
 
-func applyCoverArt(file *id3v2.Tag, imgFilePath string) {
+func applyCoverArt(file AudioTag, imgFilePath string) {
 	openedImg, err := os.Open(imgFilePath)
 	if err != nil {
 		log.Fatal("Error opening image file: ", err)
@@ -391,35 +469,12 @@ func applyCoverArt(file *id3v2.Tag, imgFilePath string) {
 		imgFile = imaging.Resize(imgFile, 300, 300, imaging.Lanczos)
 	}
 
-	tmpFile, err := os.CreateTemp("", "coverArt-*.png")
-	if err != nil {
-		fmt.Println("Error creating temp file:", err)
-		return
-	}
-	tmpPath := tmpFile.Name()
-	tmpFile.Close()
-	defer os.Remove(tmpPath)
-
-	if err := imaging.Save(imgFile, tmpPath); err != nil {
-		fmt.Println("Error saving resized image:", err)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, imgFile); err != nil {
+		fmt.Println("Error encoding resized image:", err)
 		return
 	}
 
-	coverImg, err := os.ReadFile(tmpPath)
-	if err != nil {
-		fmt.Println("Error reading artwork file:", err)
-		return
-	}
-
-	coverArt := id3v2.PictureFrame{
-		Encoding:    id3v2.EncodingUTF8,
-		MimeType:    "image/png",
-		PictureType: id3v2.PTFrontCover,
-		Description: "Front cover",
-		Picture:     coverImg,
-	}
-
-	file.DeleteFrames(file.CommonID("Attached picture"))
-	file.AddAttachedPicture(coverArt)
+	file.SetCoverArt(buf.Bytes(), "image/png")
 	fmt.Println("Updated cover art")
 }
